@@ -5,19 +5,15 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.Web.Script.Serialization;
 
 namespace TcpJsonClient
 {
-    
-
     public partial class MainForm : Form
     {
         private TcpClient _client;
         private TcpListener _server;
         private NetworkStream _stream;
         private CancellationTokenSource _cts;
-        private JavaScriptSerializer _serializer = new JavaScriptSerializer();
 
         public MainForm()
         {
@@ -116,30 +112,34 @@ namespace TcpJsonClient
                     int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length, token);
                     if (bytesRead == 0) break;
 
-                    string json = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    try
+                    string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    AppendReceiveText($"[接收] {msg}");
+
+                    // 移植 ZBTAOIFunction 的 Link1 回覆邏輯
+                    if (msg.Contains("Link1"))
                     {
-                        var payload = _serializer.Deserialize<MessagePayload>(json);
-                        string displayMsg = string.Format("[{0}] {1}: {2}", 
-                            payload.Timestamp, payload.Sender, payload.Content);
-                        AppendReceiveText(displayMsg);
-                    }
-                    catch (Exception)
-                    {
-                        AppendReceiveText("收到格式錯誤的資料: " + json);
+                        await SendRawMessage("Ack");
+                        AppendReceiveText("[自動回覆] Ack");
                     }
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                if (!token.IsCancellationRequested)
+                {
+                    AppendReceiveText($"[錯誤] {ex.Message}");
+                }
             }
             finally
             {
-                this.Invoke(new Action(() => Disconnect()));
+                if (!token.IsCancellationRequested)
+                {
+                    this.Invoke(new Action(() => Disconnect()));
+                }
             }
         }
 
-        private void btnSend_Click(object sender, EventArgs e)
+        private async void btnSend_Click(object sender, EventArgs e)
         {
             if (_client == null || !_client.Connected)
             {
@@ -147,26 +147,27 @@ namespace TcpJsonClient
                 return;
             }
 
+            string textToSend = txtSend.Text;
+            if (string.IsNullOrEmpty(textToSend)) return;
+
             try
             {
-                var payload = new MessagePayload
-                {
-                    Sender = txtName.Text,
-                    Content = txtSend.Text,
-                    Timestamp = DateTime.Now.ToString("HH:mm:ss"),
-                    Mode = cmbMode.SelectedItem.ToString()
-                };
-
-                string json = _serializer.Serialize(payload);
-                byte[] data = Encoding.UTF8.GetBytes(json);
-                _stream.Write(data, 0, data.Length);
-                
-                // 清空發送框
+                await SendRawMessage(textToSend);
+                AppendReceiveText($"[發送] {textToSend}");
                 txtSend.Clear();
             }
             catch (Exception ex)
             {
                 MessageBox.Show("發送失敗: " + ex.Message);
+            }
+        }
+
+        private async Task SendRawMessage(string msg)
+        {
+            if (_stream != null && _client != null && _client.Connected)
+            {
+                byte[] data = Encoding.UTF8.GetBytes(msg);
+                await _stream.WriteAsync(data, 0, data.Length);
             }
         }
 
@@ -203,20 +204,12 @@ namespace TcpJsonClient
                 this.Invoke(new Action<string>(AppendReceiveText), text);
                 return;
             }
-            txtReceive.AppendText(text + Environment.NewLine);
+            txtReceive.AppendText($"[{DateTime.Now:HH:mm:ss}] {text}{Environment.NewLine}");
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
         {
             Disconnect();
         }
-    }
-
-    public class MessagePayload
-    {
-        public string Sender { get; set; }
-        public string Content { get; set; }
-        public string Timestamp { get; set; }
-        public string Mode { get; set; }
     }
 }
