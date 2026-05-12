@@ -45,7 +45,7 @@ namespace TcpJsonClient
         {
             if (btnConnect.Text == "中斷" || btnConnect.Text == "停止")
             {
-                Disconnect();
+                StopAll();
                 return;
             }
 
@@ -61,13 +61,14 @@ namespace TcpJsonClient
                 }
                 else
                 {
-                    await StartServer(ip, port);
+                    // Server 模式啟動後不 await，因為它會進入無限監聽迴圈
+                    _ = StartServer(ip, port, _cts.Token);
                 }
             }
             catch (Exception ex)
             {
                 MessageBox.Show("發生錯誤: " + ex.Message);
-                Disconnect();
+                StopAll();
             }
         }
 
@@ -79,37 +80,55 @@ namespace TcpJsonClient
             _stream = _client.GetStream();
             UpdateStatus("已連線");
             btnConnect.Text = "中斷";
-            Task.Run(() => ReceiveLoop(_cts.Token));
+            _ = ReceiveLoop(_client, _cts.Token);
         }
 
-        private async Task StartServer(string ip, int port)
+        private async Task StartServer(string ip, int port, CancellationToken token)
         {
-            IPAddress localAddr = IPAddress.Parse(ip);
-            _server = new TcpListener(localAddr, port);
-            _server.Start();
-            UpdateStatus("等待連入...");
-            btnConnect.Text = "停止";
-
             try
             {
-                _client = await _server.AcceptTcpClientAsync();
-                _stream = _client.GetStream();
-                UpdateStatus("Client 已連入");
-                Task.Run(() => ReceiveLoop(_cts.Token));
-            }
-            catch (Exception)
-            {
-            }
-        }
+                IPAddress localAddr = IPAddress.Parse(ip);
+                _server = new TcpListener(localAddr, port);
+                _server.Start();
+                UpdateStatus("Server 已啟動，監聽中...");
+                btnConnect.Text = "停止";
 
-        private async Task ReceiveLoop(CancellationToken token)
-        {
-            byte[] buffer = new byte[8192];
-            try
-            {
-                while (!token.IsCancellationRequested && _client != null && _client.Connected)
+                while (!token.IsCancellationRequested)
                 {
-                    int bytesRead = await _stream.ReadAsync(buffer, 0, buffer.Length, token);
+                    // 等待新的 Client 連入
+                    TcpClient client = await _server.AcceptTcpClientAsync();
+                    AppendReceiveText($"[系統] 新的 Client 已連入: {client.Client.RemoteEndPoint}");
+                    
+                    // 針對每個連入的 Client 啟動獨立的接收迴圈
+                    _ = ReceiveLoop(client, token);
+                }
+            }
+            catch (ObjectDisposedException)
+            {
+                // Server 被停止時會觸發此異常，正常現象
+            }
+            catch (Exception ex)
+            {
+                if (!token.IsCancellationRequested)
+                    AppendReceiveText($"[系統錯誤] Server 異常: {ex.Message}");
+            }
+            finally
+            {
+                UpdateStatus("Server 已停止");
+            }
+        }
+
+        private async Task ReceiveLoop(TcpClient client, CancellationToken token)
+        {
+            // 移植來源專案使用的 1MB 緩衝區
+            byte[] buffer = new byte[1024 * 1024];
+            NetworkStream stream = client.GetStream();
+
+            try
+            {
+                while (!token.IsCancellationRequested && client.Connected)
+                {
+                    int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, token);
                     if (bytesRead == 0) break;
 
                     string msg = Encoding.UTF8.GetString(buffer, 0, bytesRead);
@@ -118,23 +137,31 @@ namespace TcpJsonClient
                     // 移植 ZBTAOIFunction 的 Link1 回覆邏輯
                     if (msg.Contains("Link1"))
                     {
-                        await SendRawMessage("Ack");
+                        await SendRawMessage(stream, client, "Ack");
                         AppendReceiveText("[自動回覆] Ack");
+                    }
+
+                    // 如果是 Server 模式，我們可以更新當前的 _client 與 _stream 方便手動發送給最後一個連入的人
+                    if (cmbMode.SelectedItem.ToString() == "Server")
+                    {
+                        _client = client;
+                        _stream = stream;
                     }
                 }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                if (!token.IsCancellationRequested)
-                {
-                    AppendReceiveText($"[錯誤] {ex.Message}");
-                }
+                // 忽略斷線異常
             }
             finally
             {
-                if (!token.IsCancellationRequested)
+                AppendReceiveText($"[系統] Client 已中斷連線");
+                stream.Close();
+                client.Close();
+                
+                if (cmbMode.SelectedItem.ToString() == "Client")
                 {
-                    this.Invoke(new Action(() => Disconnect()));
+                    this.Invoke(new Action(() => StopAll()));
                 }
             }
         }
@@ -143,7 +170,7 @@ namespace TcpJsonClient
         {
             if (_client == null || !_client.Connected)
             {
-                MessageBox.Show("尚未建立通訊");
+                MessageBox.Show("尚未建立通訊或 Client 已斷開");
                 return;
             }
 
@@ -152,7 +179,7 @@ namespace TcpJsonClient
 
             try
             {
-                await SendRawMessage(textToSend);
+                await SendRawMessage(_stream, _client, textToSend);
                 AppendReceiveText($"[發送] {textToSend}");
                 txtSend.Clear();
             }
@@ -162,16 +189,16 @@ namespace TcpJsonClient
             }
         }
 
-        private async Task SendRawMessage(string msg)
+        private async Task SendRawMessage(NetworkStream stream, TcpClient client, string msg)
         {
-            if (_stream != null && _client != null && _client.Connected)
+            if (stream != null && client != null && client.Connected)
             {
                 byte[] data = Encoding.UTF8.GetBytes(msg);
-                await _stream.WriteAsync(data, 0, data.Length);
+                await stream.WriteAsync(data, 0, data.Length);
             }
         }
 
-        private void Disconnect()
+        private void StopAll()
         {
             _cts?.Cancel();
             _stream?.Close();
@@ -183,7 +210,7 @@ namespace TcpJsonClient
             _server = null;
             _cts = null;
 
-            UpdateStatus("已斷線");
+            UpdateStatus("已停止");
             btnConnect.Text = cmbMode.SelectedItem.ToString() == "Server" ? "啟動" : "連線";
         }
 
@@ -209,7 +236,7 @@ namespace TcpJsonClient
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
         {
-            Disconnect();
+            StopAll();
         }
     }
 }
